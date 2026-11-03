@@ -78,6 +78,7 @@ def create_lesson(
         body.title,
         body.body,
         body.mux_asset_id,
+        body.youtube_video_id,
     )
 
 
@@ -87,10 +88,14 @@ def update_lesson(
     body: LessonUpdate,
     user: CurrentUser = Depends(require_role("teacher")),
 ) -> dict:
+    updates = body.model_dump(exclude_unset=True)
+    if "youtube_url" in updates:
+        updates["youtube_video_id"] = body.youtube_video_id
+        del updates["youtube_url"]
     return lesson_service.update_lesson(
         user.role_row_id,
         str(lesson_id),
-        body.model_dump(exclude_unset=True),
+        updates,
     )
 
 

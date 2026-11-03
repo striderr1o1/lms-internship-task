@@ -1,6 +1,7 @@
 from functools import lru_cache
 from pathlib import Path
 
+from pydantic import field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 _ENV_FILE = Path(__file__).resolve().parents[2] / ".env"
@@ -18,6 +19,11 @@ class Settings(BaseSettings):
     supabase_publishable_key: str = ""
     frontend_origin: str = "http://localhost:5173"
     mux_token_id: str = ""
+
+    @field_validator("frontend_origin")
+    @classmethod
+    def normalize_frontend_origin(cls, value: str) -> str:
+        return value.strip().rstrip("/")
     mux_token_secret: str = ""
     mux_webhook_secret: str = ""
 

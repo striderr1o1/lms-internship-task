@@ -168,7 +168,9 @@ def _lesson_counts(course_ids: list[str]) -> dict[str, int]:
 def _student_lessons(course_id: str) -> list[dict]:
     found = rows(
         admin.table("lessons")
-        .select("id, lesson_number, title, body, mux_assets(status, playback_id)")
+        .select(
+            "id, lesson_number, title, body, youtube_video_id, mux_assets(status, playback_id)"
+        )
         .eq("course_id", course_id)
         .order("lesson_number")
         .execute()
@@ -180,7 +182,8 @@ def _teacher_lessons(course_id: str) -> list[dict]:
     found = rows(
         admin.table("lessons")
         .select(
-            "id, lesson_number, title, body, mux_asset_id, mux_assets(status, playback_id)"
+            "id, lesson_number, title, body, mux_asset_id, youtube_video_id, "
+            "mux_assets(status, playback_id)"
         )
         .eq("course_id", course_id)
         .order("lesson_number")
@@ -200,6 +203,7 @@ def _student_lesson(row: dict) -> dict:
         "title": row["title"],
         "body": row["body"],
         "playback_id": playback_id,
+        "youtube_video_id": row.get("youtube_video_id") or None,
     }
 
 
@@ -208,7 +212,16 @@ def _teacher_lesson(row: dict) -> dict:
     asset = _asset(row)
     lesson["mux_asset_id"] = row.get("mux_asset_id")
     lesson["video_status"] = asset.get("status") if asset is not None else None
+    lesson["video_source"] = _video_source(lesson["mux_asset_id"], lesson["youtube_video_id"])
     return lesson
+
+
+def _video_source(mux_asset_id: object, youtube_video_id: str | None) -> str | None:
+    if mux_asset_id:
+        return "mux"
+    if youtube_video_id:
+        return "youtube"
+    return None
 
 
 def _asset(row: dict) -> dict | None:

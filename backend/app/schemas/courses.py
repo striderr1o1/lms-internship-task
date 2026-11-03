@@ -3,6 +3,8 @@ from uuid import UUID
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 
+from app.services.youtube import parse_youtube_video_id
+
 
 def _clean_name(value: str) -> str:
     cleaned = value.strip()
@@ -16,6 +18,23 @@ def _clean_title(value: str) -> str:
     if not 1 <= len(cleaned) <= 160:
         raise ValueError("Title must be between 1 and 160 characters")
     return cleaned
+
+
+def _clean_youtube_url(value: object) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise ValueError("YouTube URL must be a string")
+    cleaned = value.strip()
+    if not cleaned:
+        return None
+    parse_youtube_video_id(cleaned)
+    return cleaned
+
+
+def _reject_two_videos(mux_asset_id: UUID | None, youtube_url: str | None) -> None:
+    if mux_asset_id is not None and youtube_url is not None:
+        raise ValueError("A lesson cannot have both a Mux video and a YouTube video")
 
 
 class CourseCreate(BaseModel):
@@ -68,11 +87,13 @@ class StudentLesson(BaseModel):
     title: str
     body: str
     playback_id: str | None
+    youtube_video_id: str | None
 
 
 class TeacherLesson(StudentLesson):
     mux_asset_id: UUID | None
     video_status: Literal["waiting", "asset_created", "ready", "errored"] | None
+    video_source: Literal["mux", "youtube"] | None
 
 
 class StudentCourseDetail(CourseOut):
@@ -87,6 +108,7 @@ class LessonCreate(BaseModel):
     title: str
     body: str = ""
     mux_asset_id: UUID | None = None
+    youtube_url: str | None = None
 
     @field_validator("title")
     @classmethod
@@ -102,11 +124,28 @@ class LessonCreate(BaseModel):
             raise ValueError("Body must be a string")
         return value
 
+    @field_validator("youtube_url", mode="before")
+    @classmethod
+    def validate_youtube_url(cls, value: object) -> str | None:
+        return _clean_youtube_url(value)
+
+    @model_validator(mode="after")
+    def single_video(self) -> "LessonCreate":
+        _reject_two_videos(self.mux_asset_id, self.youtube_url)
+        return self
+
+    @property
+    def youtube_video_id(self) -> str | None:
+        if self.youtube_url is None:
+            return None
+        return parse_youtube_video_id(self.youtube_url)
+
 
 class LessonUpdate(BaseModel):
     title: str | None = None
     body: str | None = None
     mux_asset_id: UUID | None = None
+    youtube_url: str | None = None
 
     @field_validator("title")
     @classmethod
@@ -122,15 +161,29 @@ class LessonUpdate(BaseModel):
             return None
         return value
 
+    @field_validator("youtube_url", mode="before")
+    @classmethod
+    def validate_youtube_url(cls, value: object) -> str | None:
+        return _clean_youtube_url(value)
+
     @model_validator(mode="after")
     def at_least_one(self) -> "LessonUpdate":
+        _reject_two_videos(self.mux_asset_id, self.youtube_url)
         if not self.model_fields_set:
-            raise ValueError("At least one of title, body, or mux_asset_id is required")
+            raise ValueError(
+                "At least one of title, body, mux_asset_id, or youtube_url is required"
+            )
         if "title" in self.model_fields_set and self.title is None:
             raise ValueError("Title must be between 1 and 160 characters")
         if "body" in self.model_fields_set and self.body is None:
             raise ValueError("Body must be a string")
         return self
+
+    @property
+    def youtube_video_id(self) -> str | None:
+        if self.youtube_url is None:
+            return None
+        return parse_youtube_video_id(self.youtube_url)
 
 
 class EnrollmentOut(BaseModel):
