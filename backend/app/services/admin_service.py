@@ -1,118 +1,134 @@
+import psycopg
 from fastapi import HTTPException
-from postgrest.types import CountMethod
-from supabase_auth.errors import AuthError
 
-from app.db import admin, rows
+from app.db import database_error, query_all, query_one
 
 
 def overview() -> dict:
-    teacher_rows = rows(admin.table("teachers").select("id, profiles(username)").execute())
-    course_rows = rows(
-        admin.table("courses").select("id, teacher_id, name, status").execute()
-    )
-    enrollment_rows = rows(
-        admin.table("enrollments")
-        .select("course_id, students(profiles(username))")
-        .execute()
-    )
-
-    students_by_course: dict[str, list[str]] = {}
-    for row in enrollment_rows:
-        username = _nested_username(row.get("students"))
-        if username:
-            students_by_course.setdefault(row["course_id"], []).append(username)
-
-    courses_by_teacher: dict[str, list[dict]] = {}
-    for course in course_rows:
-        courses_by_teacher.setdefault(course["teacher_id"], []).append(
-            {
-                "id": course["id"],
-                "name": course["name"],
-                "status": course["status"],
-                "students": sorted(students_by_course.get(course["id"], [])),
-            }
+    try:
+        counts = query_one(
+            """
+            select
+              (select count(*)::int from students) as student_count,
+              (select count(*)::int from teachers) as teacher_count,
+              (select count(*)::int from courses) as course_count
+            """
         )
+        rows = query_all(
+            """
+            select
+              t.id as teacher_id,
+              p.username as username,
+              c.id as course_id,
+              c.name as course_name,
+              c.status as course_status,
+              sp.username as student_username
+            from teachers as t
+            join profiles as p on p.id = t.profile_id
+            left join courses as c on c.teacher_id = t.id
+            left join enrollments as e on e.course_id = c.id
+            left join students as s on s.id = e.student_id
+            left join profiles as sp on sp.id = s.profile_id
+            """
+        )
+    except psycopg.Error as exc:
+        raise database_error(exc) from exc
+    if counts is None:
+        raise HTTPException(status_code=500, detail="Database request failed")
+    return _overview(counts, rows)
+
+
+def list_admins(status: str) -> list[dict]:
+    try:
+        found = query_all(
+            """
+            select
+              a.id,
+              p.username,
+              p.email,
+              a.status,
+              a.created_at
+            from admins as a
+            join profiles as p on p.id = a.profile_id
+            where a.status = %s
+            order by a.created_at asc
+            """,
+            (status,),
+        )
+    except psycopg.Error as exc:
+        raise database_error(exc) from exc
+    return [_admin_account(row) for row in found]
+
+
+def approve(admin_id: str) -> dict:
+    try:
+        row = query_one(
+            """
+            update admins as a
+            set status = 'approved'
+            from profiles as p
+            where a.profile_id = p.id
+              and a.id = %s
+            returning a.id, p.username, p.email, a.status, a.created_at
+            """,
+            (admin_id,),
+        )
+    except psycopg.Error as exc:
+        raise database_error(exc) from exc
+    if row is None:
+        raise HTTPException(status_code=404, detail="Not found")
+    return _admin_account(row)
+
+
+def _overview(counts: dict, rows: list[dict]) -> dict:
+    teacher_names: dict = {}
+    courses_by_teacher: dict = {}
+    for row in rows:
+        teacher_id = row["teacher_id"]
+        teacher_names[teacher_id] = row["username"] or ""
+        courses = courses_by_teacher.setdefault(teacher_id, {})
+        course_id = row["course_id"]
+        if course_id is None:
+            continue
+        course = courses.get(course_id)
+        if course is None:
+            course = {
+                "id": course_id,
+                "name": row["course_name"],
+                "status": row["course_status"],
+                "students": [],
+            }
+            courses[course_id] = course
+        if row["student_username"]:
+            course["students"].append(row["student_username"])
 
     teachers = []
-    for teacher in teacher_rows:
-        username = _nested_username(teacher.get("profiles"))
-        courses = sorted(
-            courses_by_teacher.get(teacher["id"], []),
-            key=lambda course: course["name"],
-        )
+    for teacher_id, username in teacher_names.items():
+        courses = list(courses_by_teacher.get(teacher_id, {}).values())
+        for course in courses:
+            course["students"] = sorted(course["students"])
+        courses.sort(key=lambda course: course["name"])
         teachers.append(
             {
-                "teacher_id": teacher["id"],
+                "teacher_id": teacher_id,
                 "username": username,
                 "courses": courses,
             }
         )
     teachers.sort(key=lambda teacher: teacher["username"])
     return {
-        "student_count": _count("students"),
-        "teacher_count": _count("teachers"),
-        "course_count": _count("courses"),
+        "student_count": int(counts["student_count"]),
+        "teacher_count": int(counts["teacher_count"]),
+        "course_count": int(counts["course_count"]),
         "teachers": teachers,
     }
-
-
-def list_admins(status: str) -> list[dict]:
-    found = rows(
-        admin.table("admins")
-        .select("id, profile_id, status, created_at, profiles(username)")
-        .eq("status", status)
-        .order("created_at")
-        .execute()
-    )
-    return [_admin_account(row) for row in found]
-
-
-def approve(admin_id: str) -> dict:
-    found = rows(
-        admin.table("admins")
-        .select("id, profile_id, status, created_at, profiles(username)")
-        .eq("id", admin_id)
-        .limit(1)
-        .execute()
-    )
-    if not found:
-        raise HTTPException(status_code=404, detail="Not found")
-    admin.table("admins").update({"status": "approved"}).eq("id", admin_id).execute()
-    found[0]["status"] = "approved"
-    return _admin_account(found[0])
 
 
 def _admin_account(row: dict) -> dict:
     return {
         "id": row["id"],
-        "username": _nested_username(row.get("profiles")),
-        "email": _email(row["profile_id"]),
+        "username": row["username"] or "",
+        "email": row["email"] or "",
         "status": row["status"],
-        "created_at": row["created_at"],
+        "created_at": row["created_at"].isoformat(),
     }
-
-
-def _email(profile_id: str) -> str:
-    try:
-        response = admin.auth.admin.get_user_by_id(profile_id)
-    except AuthError:
-        return ""
-    user = response.user
-    if user is None or not user.email:
-        return ""
-    return user.email
-
-
-def _nested_username(value) -> str:
-    if isinstance(value, list):
-        value = value[0] if value else None
-    if not isinstance(value, dict):
-        return ""
-    if "username" in value:
-        return value.get("username") or ""
-    return _nested_username(value.get("profiles"))
-
-
-def _count(table: str) -> int:
-    response = admin.table(table).select("id", count=CountMethod.exact, head=True).execute()
-    return response.count or 0

@@ -1,11 +1,13 @@
 from uuid import UUID
 
+import psycopg
 from fastapi import HTTPException
-from postgrest.exceptions import APIError
 
-from app.db import admin, database_error, rows
-from app.services.course_service import _teacher_lesson
+from app.db import database_error, query_one, transaction
+from app.services.course_service import _load_teacher_lesson
 from app.services.youtube import parse_youtube_video_id
+
+_UPDATABLE = ("title", "body", "mux_asset_id", "youtube_video_id")
 
 
 def create_lesson(
@@ -23,118 +25,109 @@ def create_lesson(
             detail="A lesson cannot have both a Mux video and a YouTube video",
         )
     try:
-        response = admin.rpc(
-            "create_lesson",
-            {
-                "p_course_id": course_id,
-                "p_teacher_id": teacher_id,
-                "p_title": title,
-                "p_body": body,
-                "p_mux_asset_id": str(mux_asset_id) if mux_asset_id else None,
-                "p_youtube_video_id": youtube_video_id,
-            },
-        ).execute()
-    except APIError as exc:
+        created = query_one(
+            """
+            select public.create_lesson(%s, %s, %s, %s, %s, %s) as id
+            """,
+            (course_id, teacher_id, title, body, mux_asset_id, youtube_video_id),
+        )
+    except psycopg.Error as exc:
         raise database_error(exc) from exc
-
-    lesson_id = _scalar_id(response.data)
-    return _load_teacher_lesson(lesson_id)
+    if created is None or created["id"] is None:
+        raise HTTPException(status_code=500, detail="Database request failed")
+    return _load_teacher_lesson(str(created["id"]))
 
 
 def update_lesson(teacher_id: str, lesson_id: str, updates: dict) -> dict:
-    _owned_lesson(teacher_id, lesson_id)
-    payload: dict = {}
-    if "title" in updates:
-        payload["title"] = updates["title"]
-    if "body" in updates:
-        payload["body"] = updates["body"]
-    has_mux = "mux_asset_id" in updates
-    has_youtube = "youtube_video_id" in updates
-    mux_asset_id = updates.get("mux_asset_id") if has_mux else None
-    youtube_video_id = _youtube_video_id(updates.get("youtube_video_id")) if has_youtube else None
-    if has_mux and mux_asset_id is not None and has_youtube and youtube_video_id is not None:
-        raise HTTPException(
-            status_code=422,
-            detail="A lesson cannot have both a Mux video and a YouTube video",
-        )
-    if has_mux:
-        if mux_asset_id is None:
-            payload["mux_asset_id"] = None
-        else:
-            _owned_asset(teacher_id, str(mux_asset_id))
-            payload["mux_asset_id"] = str(mux_asset_id)
-            payload["youtube_video_id"] = None
-    if has_youtube:
-        if youtube_video_id is None:
-            payload["youtube_video_id"] = None
-        else:
-            payload["youtube_video_id"] = youtube_video_id
-            payload["mux_asset_id"] = None
-    if not payload:
-        raise HTTPException(
-            status_code=422,
-            detail="At least one of title, body, mux_asset_id, or youtube_url is required",
-        )
     try:
-        admin.table("lessons").update(payload).eq("id", lesson_id).execute()
-    except APIError as exc:
+        with transaction() as conn:
+            owned = conn.execute(
+                """
+                select c.teacher_id
+                from lessons as l
+                join courses as c on c.id = l.course_id
+                where l.id = %s
+                """,
+                (lesson_id,),
+            ).fetchone()
+            if owned is None or str(owned["teacher_id"]) != str(teacher_id):
+                raise HTTPException(status_code=404, detail="Not found")
+
+            payload: dict = {}
+            if "title" in updates:
+                payload["title"] = updates["title"]
+            if "body" in updates:
+                payload["body"] = updates["body"]
+            has_mux = "mux_asset_id" in updates
+            has_youtube = "youtube_video_id" in updates
+            mux_asset_id = updates.get("mux_asset_id") if has_mux else None
+            youtube_video_id = (
+                _youtube_video_id(updates.get("youtube_video_id")) if has_youtube else None
+            )
+            both_videos = (
+                has_mux
+                and mux_asset_id is not None
+                and has_youtube
+                and youtube_video_id is not None
+            )
+            if both_videos:
+                raise HTTPException(
+                    status_code=422,
+                    detail="A lesson cannot have both a Mux video and a YouTube video",
+                )
+            if has_mux:
+                if mux_asset_id is None:
+                    payload["mux_asset_id"] = None
+                else:
+                    _owned_asset(conn, teacher_id, str(mux_asset_id))
+                    payload["mux_asset_id"] = mux_asset_id
+                    payload["youtube_video_id"] = None
+            if has_youtube:
+                if youtube_video_id is None:
+                    payload["youtube_video_id"] = None
+                else:
+                    payload["youtube_video_id"] = youtube_video_id
+                    payload["mux_asset_id"] = None
+            if not payload:
+                raise HTTPException(
+                    status_code=422,
+                    detail="At least one of title, body, mux_asset_id, or youtube_url is required",
+                )
+
+            columns = [column for column in _UPDATABLE if column in payload]
+            assignments = ", ".join(f"{column} = %s" for column in columns)
+            params = [payload[column] for column in columns]
+            params.append(lesson_id)
+            conn.execute(
+                f"update lessons set {assignments} where id = %s",
+                params,
+            )
+    except psycopg.Error as exc:
         raise database_error(exc) from exc
     return _load_teacher_lesson(lesson_id)
 
 
 def delete_lesson(teacher_id: str, lesson_id: str) -> None:
     try:
-        admin.rpc(
-            "delete_lesson",
-            {"p_lesson_id": lesson_id, "p_teacher_id": teacher_id},
-        ).execute()
-    except APIError as exc:
+        query_one(
+            "select public.delete_lesson(%s, %s)",
+            (lesson_id, teacher_id),
+        )
+    except psycopg.Error as exc:
         raise database_error(exc) from exc
 
 
-def _owned_lesson(teacher_id: str, lesson_id: str) -> None:
-    found = rows(
-        admin.table("lessons")
-        .select("id, courses!inner(teacher_id)")
-        .eq("id", lesson_id)
-        .limit(1)
-        .execute()
-    )
-    if not found:
+def _owned_asset(conn, teacher_id: str, asset_id: str) -> None:
+    found = conn.execute(
+        """
+        select teacher_id
+        from mux_assets
+        where id = %s
+        """,
+        (asset_id,),
+    ).fetchone()
+    if found is None or str(found["teacher_id"]) != str(teacher_id):
         raise HTTPException(status_code=404, detail="Not found")
-    course = found[0].get("courses")
-    if isinstance(course, list):
-        course = course[0] if course else None
-    if not isinstance(course, dict) or course.get("teacher_id") != teacher_id:
-        raise HTTPException(status_code=404, detail="Not found")
-
-
-def _owned_asset(teacher_id: str, asset_id: str) -> None:
-    found = rows(
-        admin.table("mux_assets")
-        .select("id, teacher_id")
-        .eq("id", asset_id)
-        .limit(1)
-        .execute()
-    )
-    if not found or found[0].get("teacher_id") != teacher_id:
-        raise HTTPException(status_code=404, detail="Not found")
-
-
-def _load_teacher_lesson(lesson_id: str) -> dict:
-    found = rows(
-        admin.table("lessons")
-        .select(
-            "id, lesson_number, title, body, mux_asset_id, youtube_video_id, "
-            "mux_assets(status, playback_id)"
-        )
-        .eq("id", lesson_id)
-        .limit(1)
-        .execute()
-    )
-    if not found:
-        raise HTTPException(status_code=404, detail="Not found")
-    return _teacher_lesson(found[0])
 
 
 def _youtube_video_id(value: object) -> str | None:
@@ -144,11 +137,3 @@ def _youtube_video_id(value: object) -> str | None:
         return parse_youtube_video_id(value)
     except ValueError as exc:
         raise HTTPException(status_code=422, detail="Invalid YouTube URL") from exc
-
-
-def _scalar_id(data) -> str:
-    if isinstance(data, list):
-        data = data[0] if data else None
-    if not isinstance(data, str) or not data:
-        raise HTTPException(status_code=500, detail="Database request failed")
-    return data

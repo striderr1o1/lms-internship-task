@@ -1,94 +1,199 @@
+import psycopg
 from fastapi import HTTPException
 
-from app.db import admin, rows
+from app.db import database_error, execute, query_all, query_one, transaction
+
+_COURSE_WITH_COUNT = """
+select
+  c.id,
+  c.name,
+  c.status,
+  c.created_at,
+  p.username as teacher_username,
+  count(l.id)::int as lesson_count
+from courses as c
+join teachers as t on t.id = c.teacher_id
+join profiles as p on p.id = t.profile_id
+left join lessons as l on l.course_id = c.id
+"""
+
+_COURSE_HEADER = """
+select
+  c.id,
+  c.name,
+  c.status,
+  c.created_at,
+  p.username as teacher_username
+from courses as c
+join teachers as t on t.id = c.teacher_id
+join profiles as p on p.id = t.profile_id
+"""
+
+_LESSONS = """
+select
+  l.id,
+  l.lesson_number,
+  l.title,
+  l.body,
+  l.mux_asset_id,
+  l.youtube_video_id,
+  m.status as mux_status,
+  m.playback_id as mux_playback_id
+from lessons as l
+left join mux_assets as m on m.id = l.mux_asset_id
+"""
 
 
 def create_course(teacher_id: str, teacher_username: str, name: str) -> dict:
-    inserted = rows(
-        admin.table("courses").insert({"teacher_id": teacher_id, "name": name}).execute()
-    )
-    if not inserted:
+    try:
+        inserted = query_one(
+            """
+            insert into courses (teacher_id, name)
+            values (%s, %s)
+            returning id, name, status, created_at
+            """,
+            (teacher_id, name),
+        )
+    except psycopg.Error as exc:
+        raise database_error(exc) from exc
+    if inserted is None:
         raise HTTPException(status_code=500, detail="Database request failed")
-    return _course(inserted[0], teacher_username=teacher_username, lesson_count=0)
+    return _course(inserted, teacher_username=teacher_username, lesson_count=0)
 
 
 def list_teacher_courses(teacher_id: str) -> list[dict]:
-    found = rows(
-        admin.table("courses")
-        .select(_COURSE_COLUMNS)
-        .eq("teacher_id", teacher_id)
-        .order("created_at", desc=True)
-        .execute()
-    )
-    return _with_counts(found)
+    try:
+        found = query_all(
+            _COURSE_WITH_COUNT
+            + """
+            where c.teacher_id = %s
+            group by c.id, p.username
+            order by c.created_at desc
+            """,
+            (teacher_id,),
+        )
+    except psycopg.Error as exc:
+        raise database_error(exc) from exc
+    return [_listed_course(row) for row in found]
 
 
 def update_course(teacher_id: str, course_id: str, updates: dict) -> dict:
-    if not _teacher_owns(teacher_id, course_id):
-        raise HTTPException(status_code=404, detail="Not found")
-    payload = {key: updates[key] for key in ("name", "status") if key in updates}
-    if payload:
-        admin.table("courses").update(payload).eq("id", course_id).eq(
-            "teacher_id", teacher_id
-        ).execute()
-    course = _teacher_course_row(teacher_id, course_id)
-    if course is None:
-        raise HTTPException(status_code=404, detail="Not found")
-    counts = _lesson_counts([course_id])
-    return _course(
-        course,
-        teacher_username=_username(course),
-        lesson_count=counts.get(course_id, 0),
-    )
+    columns = [column for column in ("name", "status") if column in updates]
+    try:
+        with transaction() as conn:
+            if columns:
+                assignments = ", ".join(f"{column} = %s" for column in columns)
+                params = [updates[column] for column in columns]
+                params.extend([course_id, teacher_id])
+                updated = conn.execute(
+                    f"""
+                    update courses
+                    set {assignments}
+                    where id = %s and teacher_id = %s
+                    """,
+                    params,
+                ).rowcount
+                if updated == 0:
+                    raise HTTPException(status_code=404, detail="Not found")
+            else:
+                owned = conn.execute(
+                    """
+                    select id
+                    from courses
+                    where id = %s and teacher_id = %s
+                    """,
+                    (course_id, teacher_id),
+                ).fetchone()
+                if owned is None:
+                    raise HTTPException(status_code=404, detail="Not found")
+            course = conn.execute(
+                _COURSE_WITH_COUNT
+                + """
+                where c.id = %s and c.teacher_id = %s
+                group by c.id, p.username
+                """,
+                (course_id, teacher_id),
+            ).fetchone()
+            if course is None:
+                raise HTTPException(status_code=404, detail="Not found")
+    except psycopg.Error as exc:
+        raise database_error(exc) from exc
+    return _listed_course(course)
 
 
 def delete_course(teacher_id: str, course_id: str) -> None:
-    if not _teacher_owns(teacher_id, course_id):
+    try:
+        deleted = execute(
+            """
+            delete from courses
+            where id = %s and teacher_id = %s
+            """,
+            (course_id, teacher_id),
+        )
+    except psycopg.Error as exc:
+        raise database_error(exc) from exc
+    if deleted == 0:
         raise HTTPException(status_code=404, detail="Not found")
-    admin.table("courses").delete().eq("id", course_id).eq("teacher_id", teacher_id).execute()
 
 
 def list_catalog(student_id: str) -> list[dict]:
-    found = rows(
-        admin.table("courses")
-        .select(_COURSE_COLUMNS)
-        .eq("status", "active")
-        .order("created_at", desc=True)
-        .execute()
-    )
-    enrolled = _enrolled_ids(student_id)
-    counts = _lesson_counts([row["id"] for row in found])
-    return [
-        _course(
-            row,
-            teacher_username=_username(row),
-            lesson_count=counts.get(row["id"], 0),
-            enrolled=row["id"] in enrolled,
+    try:
+        found = query_all(
+            """
+            select
+              c.id,
+              c.name,
+              c.status,
+              c.created_at,
+              p.username as teacher_username,
+              count(l.id)::int as lesson_count,
+              bool_or(e.id is not null) as enrolled
+            from courses as c
+            join teachers as t on t.id = c.teacher_id
+            join profiles as p on p.id = t.profile_id
+            left join lessons as l on l.course_id = c.id
+            left join enrollments as e
+              on e.course_id = c.id
+             and e.student_id = %s
+            where c.status = 'active'
+            group by c.id, p.username
+            order by c.created_at desc
+            """,
+            (student_id,),
         )
-        for row in found
-    ]
+    except psycopg.Error as exc:
+        raise database_error(exc) from exc
+    return [_listed_course(row, enrolled=bool(row["enrolled"])) for row in found]
 
 
 def get_student_course(student_id: str, course_id: str) -> dict:
-    enrollment = rows(
-        admin.table("enrollments")
-        .select("id")
-        .eq("student_id", student_id)
-        .eq("course_id", course_id)
-        .limit(1)
-        .execute()
-    )
-    if not enrollment:
-        raise HTTPException(status_code=404, detail="Not found")
-    found = rows(
-        admin.table("courses").select(_COURSE_COLUMNS).eq("id", course_id).limit(1).execute()
-    )
-    if not found:
-        raise HTTPException(status_code=404, detail="Not found")
-    lessons = _student_lessons(course_id)
+    try:
+        with transaction() as conn:
+            found = conn.execute(
+                _COURSE_HEADER
+                + """
+                join enrollments as e on e.course_id = c.id
+                where e.student_id = %s
+                  and e.course_id = %s
+                """,
+                (student_id, course_id),
+            ).fetchone()
+            if found is None:
+                raise HTTPException(status_code=404, detail="Not found")
+            lesson_rows = conn.execute(
+                _LESSONS
+                + """
+                where l.course_id = %s
+                order by l.lesson_number
+                """,
+                (course_id,),
+            ).fetchall()
+    except psycopg.Error as exc:
+        raise database_error(exc) from exc
+    lessons = [_student_lesson(row) for row in lesson_rows]
     course = _course(
-        found[0],
-        teacher_username=_username(found[0]),
+        found,
+        teacher_username=found["teacher_username"] or "",
         lesson_count=len(lessons),
     )
     course["lessons"] = lessons
@@ -96,107 +201,63 @@ def get_student_course(student_id: str, course_id: str) -> dict:
 
 
 def get_teacher_course(teacher_id: str, course_id: str) -> dict:
-    course = _teacher_course_row(teacher_id, course_id)
-    if course is None:
-        raise HTTPException(status_code=404, detail="Not found")
-    lessons = _teacher_lessons(course_id)
-    payload = _course(
-        course,
-        teacher_username=_username(course),
+    try:
+        with transaction() as conn:
+            found = conn.execute(
+                _COURSE_HEADER
+                + """
+                where c.id = %s and c.teacher_id = %s
+                """,
+                (course_id, teacher_id),
+            ).fetchone()
+            if found is None:
+                raise HTTPException(status_code=404, detail="Not found")
+            lesson_rows = conn.execute(
+                _LESSONS
+                + """
+                where l.course_id = %s
+                order by l.lesson_number
+                """,
+                (course_id,),
+            ).fetchall()
+    except psycopg.Error as exc:
+        raise database_error(exc) from exc
+    lessons = [_teacher_lesson(row) for row in lesson_rows]
+    course = _course(
+        found,
+        teacher_username=found["teacher_username"] or "",
         lesson_count=len(lessons),
     )
-    payload["lessons"] = lessons
-    return payload
+    course["lessons"] = lessons
+    return course
 
 
-def _teacher_owns(teacher_id: str, course_id: str) -> bool:
-    found = rows(
-        admin.table("courses")
-        .select("id")
-        .eq("id", course_id)
-        .eq("teacher_id", teacher_id)
-        .limit(1)
-        .execute()
-    )
-    return bool(found)
-
-
-def _teacher_course_row(teacher_id: str, course_id: str) -> dict | None:
-    found = rows(
-        admin.table("courses")
-        .select(_COURSE_COLUMNS)
-        .eq("id", course_id)
-        .eq("teacher_id", teacher_id)
-        .limit(1)
-        .execute()
-    )
-    return found[0] if found else None
-
-
-def _with_counts(found: list[dict]) -> list[dict]:
-    counts = _lesson_counts([row["id"] for row in found])
-    return [
-        _course(
-            row,
-            teacher_username=_username(row),
-            lesson_count=counts.get(row["id"], 0),
+def _load_teacher_lesson(lesson_id: str) -> dict:
+    try:
+        row = query_one(
+            _LESSONS + " where l.id = %s",
+            (lesson_id,),
         )
-        for row in found
-    ]
+    except psycopg.Error as exc:
+        raise database_error(exc) from exc
+    if row is None:
+        raise HTTPException(status_code=404, detail="Not found")
+    return _teacher_lesson(row)
 
 
-def _enrolled_ids(student_id: str) -> set[str]:
-    found = rows(
-        admin.table("enrollments").select("course_id").eq("student_id", student_id).execute()
+def _listed_course(row: dict, *, enrolled: bool | None = None) -> dict:
+    return _course(
+        row,
+        teacher_username=row["teacher_username"] or "",
+        lesson_count=int(row["lesson_count"]),
+        enrolled=enrolled,
     )
-    return {row["course_id"] for row in found}
-
-
-def _lesson_counts(course_ids: list[str]) -> dict[str, int]:
-    if not course_ids:
-        return {}
-    found = rows(
-        admin.table("lessons").select("course_id").in_("course_id", course_ids).execute()
-    )
-    counts: dict[str, int] = {}
-    for row in found:
-        course_id = row["course_id"]
-        counts[course_id] = counts.get(course_id, 0) + 1
-    return counts
-
-
-def _student_lessons(course_id: str) -> list[dict]:
-    found = rows(
-        admin.table("lessons")
-        .select(
-            "id, lesson_number, title, body, youtube_video_id, mux_assets(status, playback_id)"
-        )
-        .eq("course_id", course_id)
-        .order("lesson_number")
-        .execute()
-    )
-    return [_student_lesson(row) for row in found]
-
-
-def _teacher_lessons(course_id: str) -> list[dict]:
-    found = rows(
-        admin.table("lessons")
-        .select(
-            "id, lesson_number, title, body, mux_asset_id, youtube_video_id, "
-            "mux_assets(status, playback_id)"
-        )
-        .eq("course_id", course_id)
-        .order("lesson_number")
-        .execute()
-    )
-    return [_teacher_lesson(row) for row in found]
 
 
 def _student_lesson(row: dict) -> dict:
-    asset = _asset(row)
     playback_id = None
-    if asset is not None and asset.get("status") == "ready":
-        playback_id = asset.get("playback_id")
+    if row.get("mux_status") == "ready":
+        playback_id = row.get("mux_playback_id")
     return {
         "id": row["id"],
         "lesson_number": row["lesson_number"],
@@ -209,9 +270,8 @@ def _student_lesson(row: dict) -> dict:
 
 def _teacher_lesson(row: dict) -> dict:
     lesson = _student_lesson(row)
-    asset = _asset(row)
     lesson["mux_asset_id"] = row.get("mux_asset_id")
-    lesson["video_status"] = asset.get("status") if asset is not None else None
+    lesson["video_status"] = row.get("mux_status")
     lesson["video_source"] = _video_source(lesson["mux_asset_id"], lesson["youtube_video_id"])
     return lesson
 
@@ -222,29 +282,6 @@ def _video_source(mux_asset_id: object, youtube_video_id: str | None) -> str | N
     if youtube_video_id:
         return "youtube"
     return None
-
-
-def _asset(row: dict) -> dict | None:
-    asset = row.get("mux_assets")
-    if isinstance(asset, list):
-        asset = asset[0] if asset else None
-    if not isinstance(asset, dict) or not asset:
-        return None
-    return asset
-
-
-def _username(row: dict) -> str:
-    teacher = row.get("teachers")
-    if isinstance(teacher, list):
-        teacher = teacher[0] if teacher else None
-    if not isinstance(teacher, dict):
-        return ""
-    profile = teacher.get("profiles")
-    if isinstance(profile, list):
-        profile = profile[0] if profile else None
-    if not isinstance(profile, dict):
-        return ""
-    return profile.get("username") or ""
 
 
 def _course(
@@ -258,13 +295,10 @@ def _course(
         "id": row["id"],
         "name": row["name"],
         "status": row["status"],
-        "created_at": row["created_at"],
+        "created_at": row["created_at"].isoformat(),
         "teacher_username": teacher_username,
         "lesson_count": lesson_count,
     }
     if enrolled is not None:
         payload["enrolled"] = enrolled
     return payload
-
-
-_COURSE_COLUMNS = "id, name, status, created_at, teachers(profiles(username))"

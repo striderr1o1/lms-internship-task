@@ -1,10 +1,12 @@
 from dataclasses import dataclass
+from uuid import UUID
 
+import psycopg
 from fastapi import Depends, HTTPException
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
 from app.core.security import decode_access_token
-from app.db import admin, rows
+from app.db import database_error, query_one
 
 _bearer = HTTPBearer(auto_error=False)
 
@@ -35,48 +37,59 @@ def get_current_profile(
         raise HTTPException(status_code=401, detail="Missing authorization token")
 
     payload = decode_access_token(credentials.credentials)
-    profile_id = str(payload["sub"])
-    email = payload.get("email")
-    if not isinstance(email, str) or not email:
+    try:
+        profile_id = str(UUID(str(payload.get("sub"))))
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(status_code=401, detail="Invalid or expired token") from exc
+
+    try:
+        row = query_one(
+            """
+            select
+              p.id,
+              p.username,
+              p.email,
+              p.role,
+              s.id as student_id,
+              t.id as teacher_id,
+              a.id as admin_id,
+              a.status as admin_status
+            from profiles as p
+            left join students as s on s.profile_id = p.id
+            left join teachers as t on t.profile_id = p.id
+            left join admins as a on a.profile_id = p.id
+            where p.id = %s
+            """,
+            (profile_id,),
+        )
+    except psycopg.Error as exc:
+        raise database_error(exc) from exc
+
+    if row is None:
         raise HTTPException(status_code=401, detail="Invalid or expired token")
 
-    profile_rows = rows(
-        admin.table("profiles")
-        .select("id, username, role")
-        .eq("id", profile_id)
-        .limit(1)
-        .execute()
-    )
-    if not profile_rows:
-        raise HTTPException(status_code=401, detail="Invalid or expired token")
-    profile = profile_rows[0]
-    role = profile["role"]
-
+    role = row["role"]
     if role == "student":
-        table = "students"
-        columns = "id"
+        role_row_id = row["student_id"]
+        admin_status = None
     elif role == "teacher":
-        table = "teachers"
-        columns = "id"
+        role_row_id = row["teacher_id"]
+        admin_status = None
     elif role == "admin":
-        table = "admins"
-        columns = "id, status"
+        role_row_id = row["admin_id"]
+        admin_status = row["admin_status"]
     else:
         raise HTTPException(status_code=401, detail="Invalid or expired token")
 
-    role_rows = rows(
-        admin.table(table).select(columns).eq("profile_id", profile_id).limit(1).execute()
-    )
-    if not role_rows:
+    if role_row_id is None:
         raise HTTPException(status_code=401, detail="Invalid or expired token")
 
-    admin_status = role_rows[0].get("status") if role == "admin" else None
     return CurrentUser(
-        profile_id=str(profile["id"]),
-        username=profile["username"],
-        email=email,
+        profile_id=str(row["id"]),
+        username=row["username"],
+        email=row["email"],
         role=role,
-        role_row_id=str(role_rows[0]["id"]),
+        role_row_id=str(role_row_id),
         admin_status=admin_status,
     )
 

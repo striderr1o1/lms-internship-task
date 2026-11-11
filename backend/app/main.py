@@ -1,9 +1,12 @@
+from contextlib import asynccontextmanager
+
 from fastapi import FastAPI
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 from app.core.config import get_settings
+from app.db import close_pool, open_pool
 from app.routers.admin import router as admin_router
 from app.routers.auth import router as auth_router
 from app.routers.student import router as student_router
@@ -11,7 +14,18 @@ from app.routers.teacher import router as teacher_router
 from app.routers.webhooks import router as webhook_router
 
 settings = get_settings()
-app = FastAPI(title="Northstar LMS")
+
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    open_pool()
+    try:
+        yield
+    finally:
+        close_pool()
+
+
+app = FastAPI(title="Northstar LMS", lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[settings.frontend_origin],

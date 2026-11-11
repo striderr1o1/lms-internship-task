@@ -5,10 +5,13 @@ import logging
 import time
 
 import httpx
+import psycopg
 from fastapi import HTTPException
 
 from app.core.config import get_settings
-from app.db import admin, rows
+from app.db import database_error, execute, query_one
+
+_ASSET_COLUMNS = ("mux_asset_id", "playback_id", "status")
 
 logger = logging.getLogger(__name__)
 
@@ -38,20 +41,20 @@ def create_upload(teacher_id: str) -> dict:
     upload_url = data.get("url")
     if not isinstance(upload_id, str) or not isinstance(upload_url, str):
         raise HTTPException(status_code=502, detail=_PROVIDER)
-    inserted = rows(
-        admin.table("mux_assets")
-        .insert(
-            {
-                "teacher_id": teacher_id,
-                "upload_id": upload_id,
-                "status": "waiting",
-            }
+    try:
+        inserted = query_one(
+            """
+            insert into mux_assets (teacher_id, upload_id, status)
+            values (%s, %s, 'waiting')
+            returning id
+            """,
+            (teacher_id, upload_id),
         )
-        .execute()
-    )
-    if not inserted:
+    except psycopg.Error as exc:
+        raise database_error(exc) from exc
+    if inserted is None:
         raise HTTPException(status_code=500, detail="Database request failed")
-    return {"id": inserted[0]["id"], "upload_url": upload_url}
+    return {"id": inserted["id"], "upload_url": upload_url}
 
 
 def get_video(teacher_id: str, video_id: str) -> dict:
@@ -137,8 +140,21 @@ def _refresh(row: dict) -> dict:
 
 
 def _save(row: dict, updates: dict) -> dict:
-    admin.table("mux_assets").update(updates).eq("id", row["id"]).execute()
-    row.update(updates)
+    columns = [column for column in _ASSET_COLUMNS if column in updates]
+    if not columns:
+        return row
+    assignments = ", ".join(f"{column} = %s" for column in columns)
+    params = [updates[column] for column in columns]
+    params.append(row["id"])
+    try:
+        execute(
+            f"update mux_assets set {assignments} where id = %s",
+            tuple(params),
+        )
+    except psycopg.Error as exc:
+        raise database_error(exc) from exc
+    for column in columns:
+        row[column] = updates[column]
     return row
 
 
@@ -172,16 +188,20 @@ def _mux_data(response: httpx.Response) -> dict:
 
 
 def _owned_asset(teacher_id: str, video_id: str) -> dict:
-    found = rows(
-        admin.table("mux_assets")
-        .select("id, teacher_id, upload_id, mux_asset_id, playback_id, status")
-        .eq("id", video_id)
-        .limit(1)
-        .execute()
-    )
-    if not found or found[0].get("teacher_id") != teacher_id:
+    try:
+        found = query_one(
+            """
+            select id, teacher_id, upload_id, mux_asset_id, playback_id, status
+            from mux_assets
+            where id = %s
+            """,
+            (video_id,),
+        )
+    except psycopg.Error as exc:
+        raise database_error(exc) from exc
+    if found is None or str(found["teacher_id"]) != str(teacher_id):
         raise HTTPException(status_code=404, detail="Not found")
-    return found[0]
+    return found
 
 
 def _on_asset_created(data: dict) -> None:
@@ -189,9 +209,19 @@ def _on_asset_created(data: dict) -> None:
     asset_id = data.get("asset_id")
     if not isinstance(upload_id, str) or not isinstance(asset_id, str):
         return
-    admin.table("mux_assets").update(
-        {"mux_asset_id": asset_id, "status": "asset_created"}
-    ).eq("upload_id", upload_id).in_("status", ["waiting", "asset_created"]).execute()
+    try:
+        execute(
+            """
+            update mux_assets
+            set mux_asset_id = %s,
+                status = 'asset_created'
+            where upload_id = %s
+              and status in ('waiting', 'asset_created')
+            """,
+            (asset_id, upload_id),
+        )
+    except psycopg.Error as exc:
+        raise database_error(exc) from exc
 
 
 def _on_asset_ready(data: dict) -> None:
@@ -202,37 +232,40 @@ def _on_asset_ready(data: dict) -> None:
     updates = {"status": "ready", "playback_id": playback_id}
     if isinstance(data.get("id"), str):
         updates["mux_asset_id"] = data["id"]
-    admin.table("mux_assets").update(updates).eq("id", row["id"]).execute()
+    _save(row, updates)
 
 
 def _on_asset_errored(data: dict) -> None:
     row = _find_asset(data.get("upload_id"), data.get("id"))
     if row is None:
         return
-    admin.table("mux_assets").update({"status": "errored"}).eq("id", row["id"]).execute()
+    _save(row, {"status": "errored"})
 
 
 def _find_asset(upload_id: object, mux_asset_id: object) -> dict | None:
-    if isinstance(upload_id, str) and upload_id:
-        found = rows(
-            admin.table("mux_assets")
-            .select("id")
-            .eq("upload_id", upload_id)
-            .limit(1)
-            .execute()
-        )
-        if found:
-            return found[0]
-    if isinstance(mux_asset_id, str) and mux_asset_id:
-        found = rows(
-            admin.table("mux_assets")
-            .select("id")
-            .eq("mux_asset_id", mux_asset_id)
-            .limit(1)
-            .execute()
-        )
-        if found:
-            return found[0]
+    try:
+        if isinstance(upload_id, str) and upload_id:
+            found = query_one(
+                """
+                select id
+                from mux_assets
+                where upload_id = %s
+                """,
+                (upload_id,),
+            )
+            if found:
+                return found
+        if isinstance(mux_asset_id, str) and mux_asset_id:
+            return query_one(
+                """
+                select id
+                from mux_assets
+                where mux_asset_id = %s
+                """,
+                (mux_asset_id,),
+            )
+    except psycopg.Error as exc:
+        raise database_error(exc) from exc
     return None
 
 
