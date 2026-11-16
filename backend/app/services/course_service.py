@@ -136,36 +136,6 @@ def delete_course(teacher_id: str, course_id: str) -> None:
         raise HTTPException(status_code=404, detail="Not found")
 
 
-def list_catalog(student_id: str) -> list[dict]:
-    try:
-        found = query_all(
-            """
-            select
-              c.id,
-              c.name,
-              c.status,
-              c.created_at,
-              p.username as teacher_username,
-              count(l.id)::int as lesson_count,
-              bool_or(e.id is not null) as enrolled
-            from courses as c
-            join teachers as t on t.id = c.teacher_id
-            join profiles as p on p.id = t.profile_id
-            left join lessons as l on l.course_id = c.id
-            left join enrollments as e
-              on e.course_id = c.id
-             and e.student_id = %s
-            where c.status = 'active'
-            group by c.id, p.username
-            order by c.created_at desc
-            """,
-            (student_id,),
-        )
-    except psycopg.Error as exc:
-        raise database_error(exc) from exc
-    return [_listed_course(row, enrolled=bool(row["enrolled"])) for row in found]
-
-
 def get_student_course(student_id: str, course_id: str) -> dict:
     try:
         with transaction() as conn:
@@ -175,6 +145,7 @@ def get_student_course(student_id: str, course_id: str) -> dict:
                 join enrollments as e on e.course_id = c.id
                 where e.student_id = %s
                   and e.course_id = %s
+                  and c.status = 'active'
                 """,
                 (student_id, course_id),
             ).fetchone()
@@ -220,6 +191,19 @@ def get_teacher_course(teacher_id: str, course_id: str) -> dict:
                 """,
                 (course_id,),
             ).fetchall()
+            student_rows = conn.execute(
+                """
+                select
+                  s.id,
+                  p.username
+                from enrollments as e
+                join students as s on s.id = e.student_id
+                join profiles as p on p.id = s.profile_id
+                where e.course_id = %s
+                order by p.username
+                """,
+                (course_id,),
+            ).fetchall()
     except psycopg.Error as exc:
         raise database_error(exc) from exc
     lessons = [_teacher_lesson(row) for row in lesson_rows]
@@ -229,6 +213,10 @@ def get_teacher_course(teacher_id: str, course_id: str) -> dict:
         lesson_count=len(lessons),
     )
     course["lessons"] = lessons
+    course["students"] = [
+        {"id": row["id"], "username": row["username"] or ""}
+        for row in student_rows
+    ]
     return course
 
 

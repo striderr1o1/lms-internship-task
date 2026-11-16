@@ -1,7 +1,10 @@
+from uuid import UUID
+
 import psycopg
 from fastapi import HTTPException
 
-from app.db import database_error, query_all, query_one
+from app.db import database_error, execute, query_all, query_one, transaction
+from app.services.course_service import _COURSE_WITH_COUNT, _course
 
 
 def overview() -> dict:
@@ -22,6 +25,7 @@ def overview() -> dict:
               c.id as course_id,
               c.name as course_name,
               c.status as course_status,
+              s.id as student_id,
               sp.username as student_username
             from teachers as t
             join profiles as p on p.id = t.profile_id
@@ -96,17 +100,24 @@ def _overview(counts: dict, rows: list[dict]) -> dict:
                 "id": course_id,
                 "name": row["course_name"],
                 "status": row["course_status"],
-                "students": [],
+                "students": {},
             }
             courses[course_id] = course
-        if row["student_username"]:
-            course["students"].append(row["student_username"])
+        student_id = row["student_id"]
+        if student_id is not None and student_id not in course["students"]:
+            course["students"][student_id] = {
+                "id": student_id,
+                "username": row["student_username"] or "",
+            }
 
     teachers = []
     for teacher_id, username in teacher_names.items():
         courses = list(courses_by_teacher.get(teacher_id, {}).values())
         for course in courses:
-            course["students"] = sorted(course["students"])
+            course["students"] = sorted(
+                course["students"].values(),
+                key=lambda student: student["username"],
+            )
         courses.sort(key=lambda course: course["name"])
         teachers.append(
             {
@@ -122,6 +133,210 @@ def _overview(counts: dict, rows: list[dict]) -> dict:
         "course_count": int(counts["course_count"]),
         "teachers": teachers,
     }
+
+
+def list_teachers() -> list[dict]:
+    try:
+        found = query_all(
+            """
+            select
+              t.id as teacher_id,
+              p.username
+            from teachers as t
+            join profiles as p on p.id = t.profile_id
+            order by p.username
+            """
+        )
+    except psycopg.Error as exc:
+        raise database_error(exc) from exc
+    return [
+        {"teacher_id": row["teacher_id"], "username": row["username"] or ""}
+        for row in found
+    ]
+
+
+def list_students() -> list[dict]:
+    try:
+        found = query_all(
+            """
+            select
+              s.id,
+              p.username,
+              p.email
+            from students as s
+            join profiles as p on p.id = s.profile_id
+            order by p.username
+            """
+        )
+    except psycopg.Error as exc:
+        raise database_error(exc) from exc
+    return [
+        {
+            "id": row["id"],
+            "username": row["username"] or "",
+            "email": row["email"] or "",
+        }
+        for row in found
+    ]
+
+
+def create_course(teacher_id: str, name: str, student_ids: list[str]) -> dict:
+    distinct_student_ids = list(dict.fromkeys(UUID(student_id) for student_id in student_ids))
+    try:
+        with transaction() as conn:
+            teacher = conn.execute(
+                """
+                select t.id, p.username
+                from teachers as t
+                join profiles as p on p.id = t.profile_id
+                where t.id = %s
+                """,
+                (teacher_id,),
+            ).fetchone()
+            if teacher is None:
+                raise HTTPException(status_code=404, detail="Not found")
+            if distinct_student_ids:
+                found = conn.execute(
+                    """
+                    select id
+                    from students
+                    where id = any(%s)
+                    """,
+                    (distinct_student_ids,),
+                ).fetchall()
+                if len(found) != len(distinct_student_ids):
+                    raise HTTPException(status_code=404, detail="Not found")
+            inserted = conn.execute(
+                """
+                insert into courses (teacher_id, name, status)
+                values (%s, %s, 'active')
+                returning id, name, status, created_at
+                """,
+                (teacher_id, name),
+            ).fetchone()
+            if inserted is None:
+                raise HTTPException(status_code=500, detail="Database request failed")
+            if distinct_student_ids:
+                conn.execute(
+                    """
+                    insert into enrollments (student_id, course_id)
+                    select s.id, %s
+                    from students as s
+                    where s.id = any(%s)
+                    """,
+                    (inserted["id"], distinct_student_ids),
+                )
+    except psycopg.Error as exc:
+        raise database_error(exc) from exc
+    return _course(
+        inserted,
+        teacher_username=teacher["username"] or "",
+        lesson_count=0,
+    )
+
+
+def update_course(course_id: str, updates: dict) -> dict:
+    columns = [column for column in ("name", "status") if column in updates]
+    try:
+        with transaction() as conn:
+            if columns:
+                assignments = ", ".join(f"{column} = %s" for column in columns)
+                params = [updates[column] for column in columns]
+                params.append(course_id)
+                updated = conn.execute(
+                    f"""
+                    update courses
+                    set {assignments}
+                    where id = %s
+                    """,
+                    params,
+                ).rowcount
+                if updated == 0:
+                    raise HTTPException(status_code=404, detail="Not found")
+            else:
+                owned = conn.execute(
+                    """
+                    select id
+                    from courses
+                    where id = %s
+                    """,
+                    (course_id,),
+                ).fetchone()
+                if owned is None:
+                    raise HTTPException(status_code=404, detail="Not found")
+            course = conn.execute(
+                _COURSE_WITH_COUNT
+                + """
+                where c.id = %s
+                group by c.id, p.username
+                """,
+                (course_id,),
+            ).fetchone()
+            if course is None:
+                raise HTTPException(status_code=404, detail="Not found")
+    except psycopg.Error as exc:
+        raise database_error(exc) from exc
+    return _course(
+        course,
+        teacher_username=course["teacher_username"] or "",
+        lesson_count=int(course["lesson_count"]),
+    )
+
+
+def delete_course(course_id: str) -> None:
+    try:
+        deleted = execute(
+            """
+            delete from courses
+            where id = %s
+            """,
+            (course_id,),
+        )
+    except psycopg.Error as exc:
+        raise database_error(exc) from exc
+    if deleted == 0:
+        raise HTTPException(status_code=404, detail="Not found")
+
+
+def add_student(course_id: str, student_id: str) -> dict:
+    try:
+        inserted = query_one(
+            """
+            insert into enrollments (student_id, course_id)
+            select s.id, c.id
+            from students as s
+            cross join courses as c
+            where s.id = %s
+              and c.id = %s
+            returning course_id, student_id, enrolled_at
+            """,
+            (student_id, course_id),
+        )
+    except psycopg.Error as exc:
+        raise database_error(exc, conflict="Already enrolled") from exc
+    if inserted is None:
+        raise HTTPException(status_code=404, detail="Not found")
+    return {
+        "course_id": inserted["course_id"],
+        "student_id": inserted["student_id"],
+        "enrolled_at": inserted["enrolled_at"].isoformat(),
+    }
+
+
+def remove_student(course_id: str, student_id: str) -> None:
+    try:
+        deleted = execute(
+            """
+            delete from enrollments
+            where course_id = %s
+              and student_id = %s
+            """,
+            (course_id, student_id),
+        )
+    except psycopg.Error as exc:
+        raise database_error(exc) from exc
+    if deleted == 0:
+        raise HTTPException(status_code=404, detail="Not found")
 
 
 def _admin_account(row: dict) -> dict:

@@ -4,9 +4,7 @@ from fastapi import APIRouter, Depends, Response
 
 from app.deps import CurrentUser, require_role
 from app.schemas.courses import (
-    CourseCreate,
     CourseOut,
-    CourseUpdate,
     LessonCreate,
     LessonUpdate,
     TeacherCourseDetail,
@@ -24,42 +22,12 @@ def list_courses(user: CurrentUser = Depends(require_role("teacher"))) -> list[d
     return course_service.list_teacher_courses(user.role_row_id)
 
 
-@router.post("/courses", response_model=CourseOut, status_code=201)
-def create_course(
-    body: CourseCreate,
-    user: CurrentUser = Depends(require_role("teacher")),
-) -> dict:
-    return course_service.create_course(user.role_row_id, user.username, body.name)
-
-
 @router.get("/courses/{course_id}", response_model=TeacherCourseDetail)
 def get_course(
     course_id: UUID,
     user: CurrentUser = Depends(require_role("teacher")),
 ) -> dict:
     return course_service.get_teacher_course(user.role_row_id, str(course_id))
-
-
-@router.patch("/courses/{course_id}", response_model=CourseOut)
-def update_course(
-    course_id: UUID,
-    body: CourseUpdate,
-    user: CurrentUser = Depends(require_role("teacher")),
-) -> dict:
-    return course_service.update_course(
-        user.role_row_id,
-        str(course_id),
-        body.model_dump(exclude_unset=True),
-    )
-
-
-@router.delete("/courses/{course_id}", status_code=204)
-def delete_course(
-    course_id: UUID,
-    user: CurrentUser = Depends(require_role("teacher")),
-) -> Response:
-    course_service.delete_course(user.role_row_id, str(course_id))
-    return Response(status_code=204)
 
 
 @router.post(

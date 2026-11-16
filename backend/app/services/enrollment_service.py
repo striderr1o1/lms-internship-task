@@ -45,6 +45,7 @@ def list_enrollments(student_id: str) -> list[dict]:
             join profiles as p on p.id = t.profile_id
             left join lessons as l on l.course_id = c.id
             where e.student_id = %s
+              and c.status = 'active'
             group by e.enrolled_at, c.id, p.username
             order by e.enrolled_at desc
             """,

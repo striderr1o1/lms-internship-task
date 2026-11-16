@@ -46,6 +46,17 @@ class CourseCreate(BaseModel):
         return _clean_name(value)
 
 
+class AdminCourseCreate(BaseModel):
+    teacher_id: UUID
+    name: str
+    student_ids: list[UUID]
+
+    @field_validator("name")
+    @classmethod
+    def validate_name(cls, value: str) -> str:
+        return _clean_name(value)
+
+
 class CourseUpdate(BaseModel):
     name: str | None = None
     status: Literal["active", "inactive"] | None = None
@@ -100,8 +111,14 @@ class StudentCourseDetail(CourseOut):
     lessons: list[StudentLesson]
 
 
+class CourseStudent(BaseModel):
+    id: UUID
+    username: str
+
+
 class TeacherCourseDetail(CourseOut):
     lessons: list[TeacherLesson]
+    students: list[CourseStudent]
 
 
 class LessonCreate(BaseModel):
