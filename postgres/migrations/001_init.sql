@@ -43,8 +43,25 @@ create table public.courses (
   name text not null,
   status text not null default 'active',
   created_at timestamptz not null default now(),
+  cover_image_url text,
+  cover_source text,
+  cover_alt text,
+  cover_color text,
+  cover_blur_hash text,
+  cover_unsplash_id text,
+  cover_credit_name text,
+  cover_credit_url text,
   constraint courses_name_len check (char_length(name) between 1 and 120),
-  constraint courses_status_check check (status in ('active', 'inactive'))
+  constraint courses_status_check check (status in ('active', 'inactive')),
+  constraint courses_cover_source_check check (
+    cover_source is null or cover_source in ('unsplash', 'url', 'upload', 'generated')
+  ),
+  constraint courses_cover_color_check check (
+    cover_color is null or cover_color ~ '^#[0-9A-Fa-f]{6}$'
+  ),
+  constraint courses_cover_image_url_len check (
+    cover_image_url is null or char_length(cover_image_url) <= 2048
+  )
 );
 
 create index courses_teacher_id_idx on public.courses (teacher_id);

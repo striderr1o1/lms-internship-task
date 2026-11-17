@@ -9,6 +9,8 @@ from app.core.config import get_settings
 from app.db import close_pool, open_pool
 from app.routers.admin import router as admin_router
 from app.routers.auth import router as auth_router
+from app.routers.images import router as image_router
+from app.routers.public import router as public_router
 from app.routers.student import router as student_router
 from app.routers.teacher import router as teacher_router
 from app.routers.webhooks import router as webhook_router
@@ -37,6 +39,8 @@ app.include_router(auth_router, prefix="/api")
 app.include_router(student_router, prefix="/api")
 app.include_router(teacher_router, prefix="/api")
 app.include_router(admin_router, prefix="/api")
+app.include_router(image_router, prefix="/api")
+app.include_router(public_router, prefix="/api")
 app.include_router(webhook_router, prefix="/api")
 
 

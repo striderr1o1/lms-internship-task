@@ -3,7 +3,7 @@ from uuid import UUID
 
 from pydantic import BaseModel
 
-from app.schemas.courses import CourseStudent
+from app.schemas.courses import CourseCover, CourseStudent
 
 
 class OverviewCourse(BaseModel):
@@ -11,6 +11,7 @@ class OverviewCourse(BaseModel):
     name: str
     status: Literal["active", "inactive"]
     students: list[CourseStudent]
+    cover: CourseCover | None
 
 
 class OverviewTeacher(BaseModel):

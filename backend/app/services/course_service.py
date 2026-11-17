@@ -3,12 +3,26 @@ from fastapi import HTTPException
 
 from app.db import database_error, execute, query_all, query_one, transaction
 
-_COURSE_WITH_COUNT = """
+COVER_COLUMNS = (
+    "cover_image_url",
+    "cover_source",
+    "cover_alt",
+    "cover_color",
+    "cover_blur_hash",
+    "cover_unsplash_id",
+    "cover_credit_name",
+    "cover_credit_url",
+)
+
+COVER_SELECT = ",\n  ".join(f"c.{column}" for column in COVER_COLUMNS)
+
+_COURSE_WITH_COUNT = f"""
 select
   c.id,
   c.name,
   c.status,
   c.created_at,
+  {COVER_SELECT},
   p.username as teacher_username,
   count(l.id)::int as lesson_count
 from courses as c
@@ -17,12 +31,13 @@ join profiles as p on p.id = t.profile_id
 left join lessons as l on l.course_id = c.id
 """
 
-_COURSE_HEADER = """
+_COURSE_HEADER = f"""
 select
   c.id,
   c.name,
   c.status,
   c.created_at,
+  {COVER_SELECT},
   p.username as teacher_username
 from courses as c
 join teachers as t on t.id = c.teacher_id
@@ -47,10 +62,10 @@ left join mux_assets as m on m.id = l.mux_asset_id
 def create_course(teacher_id: str, teacher_username: str, name: str) -> dict:
     try:
         inserted = query_one(
-            """
+            f"""
             insert into courses (teacher_id, name)
             values (%s, %s)
-            returning id, name, status, created_at
+            returning id, name, status, created_at, {", ".join(COVER_COLUMNS)}
             """,
             (teacher_id, name),
         )
@@ -272,6 +287,22 @@ def _video_source(mux_asset_id: object, youtube_video_id: str | None) -> str | N
     return None
 
 
+def course_cover(row: dict) -> dict | None:
+    image_url = row.get("cover_image_url")
+    if not isinstance(image_url, str) or not image_url:
+        return None
+    return {
+        "image_url": image_url,
+        "source": row.get("cover_source"),
+        "alt": row.get("cover_alt"),
+        "color": row.get("cover_color"),
+        "blur_hash": row.get("cover_blur_hash"),
+        "unsplash_id": row.get("cover_unsplash_id"),
+        "credit_name": row.get("cover_credit_name"),
+        "credit_url": row.get("cover_credit_url"),
+    }
+
+
 def _course(
     row: dict,
     *,
@@ -286,6 +317,7 @@ def _course(
         "created_at": row["created_at"].isoformat(),
         "teacher_username": teacher_username,
         "lesson_count": lesson_count,
+        "cover": course_cover(row),
     }
     if enrolled is not None:
         payload["enrolled"] = enrolled

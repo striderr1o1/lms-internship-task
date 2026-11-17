@@ -4,7 +4,8 @@ import psycopg
 from fastapi import HTTPException
 
 from app.db import database_error, execute, query_all, query_one, transaction
-from app.services.course_service import _COURSE_WITH_COUNT, _course
+from app.services.course_service import COVER_COLUMNS, COVER_SELECT, _COURSE_WITH_COUNT, _course, course_cover
+from app.services.cover_service import prepare_cover, track_unsplash_download
 
 
 def overview() -> dict:
@@ -18,13 +19,14 @@ def overview() -> dict:
             """
         )
         rows = query_all(
-            """
+            f"""
             select
               t.id as teacher_id,
               p.username as username,
               c.id as course_id,
               c.name as course_name,
               c.status as course_status,
+              {COVER_SELECT},
               s.id as student_id,
               sp.username as student_username
             from teachers as t
@@ -102,6 +104,8 @@ def _overview(counts: dict, rows: list[dict]) -> dict:
                 "status": row["course_status"],
                 "students": {},
             }
+            for column in COVER_COLUMNS:
+                course[column] = row[column]
             courses[course_id] = course
         student_id = row["student_id"]
         if student_id is not None and student_id not in course["students"]:
@@ -113,17 +117,26 @@ def _overview(counts: dict, rows: list[dict]) -> dict:
     teachers = []
     for teacher_id, username in teacher_names.items():
         courses = list(courses_by_teacher.get(teacher_id, {}).values())
+        listed = []
         for course in courses:
-            course["students"] = sorted(
-                course["students"].values(),
-                key=lambda student: student["username"],
+            listed.append(
+                {
+                    "id": course["id"],
+                    "name": course["name"],
+                    "status": course["status"],
+                    "students": sorted(
+                        course["students"].values(),
+                        key=lambda student: student["username"],
+                    ),
+                    "cover": course_cover(course),
+                }
             )
-        courses.sort(key=lambda course: course["name"])
+        listed.sort(key=lambda course: course["name"])
         teachers.append(
             {
                 "teacher_id": teacher_id,
                 "username": username,
-                "courses": courses,
+                "courses": listed,
             }
         )
     teachers.sort(key=lambda teacher: teacher["username"])
@@ -180,7 +193,13 @@ def list_students() -> list[dict]:
     ]
 
 
-def create_course(teacher_id: str, name: str, student_ids: list[str]) -> dict:
+def create_course(
+    teacher_id: str,
+    name: str,
+    student_ids: list[str],
+    cover: dict | None = None,
+) -> dict:
+    cover_values, download_location = prepare_cover(cover)
     distinct_student_ids = list(dict.fromkeys(UUID(student_id) for student_id in student_ids))
     try:
         with transaction() as conn:
@@ -206,13 +225,20 @@ def create_course(teacher_id: str, name: str, student_ids: list[str]) -> dict:
                 ).fetchall()
                 if len(found) != len(distinct_student_ids):
                     raise HTTPException(status_code=404, detail="Not found")
+            cover_sql = ", ".join(COVER_COLUMNS)
+            cover_params = tuple(cover_values[column] for column in COVER_COLUMNS)
             inserted = conn.execute(
-                """
-                insert into courses (teacher_id, name, status)
-                values (%s, %s, 'active')
-                returning id, name, status, created_at
+                f"""
+                insert into courses (
+                  teacher_id,
+                  name,
+                  status,
+                  {cover_sql}
+                )
+                values (%s, %s, 'active', {", ".join(["%s"] * len(COVER_COLUMNS))})
+                returning id, name, status, created_at, {cover_sql}
                 """,
-                (teacher_id, name),
+                (teacher_id, name, *cover_params),
             ).fetchone()
             if inserted is None:
                 raise HTTPException(status_code=500, detail="Database request failed")
@@ -228,6 +254,7 @@ def create_course(teacher_id: str, name: str, student_ids: list[str]) -> dict:
                 )
     except psycopg.Error as exc:
         raise database_error(exc) from exc
+    track_unsplash_download(download_location)
     return _course(
         inserted,
         teacher_username=teacher["username"] or "",
@@ -236,17 +263,25 @@ def create_course(teacher_id: str, name: str, student_ids: list[str]) -> dict:
 
 
 def update_course(course_id: str, updates: dict) -> dict:
+    download_location = None
+    cover_values = None
+    if "cover" in updates:
+        cover_values, download_location = prepare_cover(updates["cover"])
     columns = [column for column in ("name", "status") if column in updates]
     try:
         with transaction() as conn:
-            if columns:
-                assignments = ", ".join(f"{column} = %s" for column in columns)
-                params = [updates[column] for column in columns]
+            assignments = [f"{column} = %s" for column in columns]
+            params: list[object] = [updates[column] for column in columns]
+            if cover_values is not None:
+                for column in COVER_COLUMNS:
+                    assignments.append(f"{column} = %s")
+                    params.append(cover_values[column])
+            if assignments:
                 params.append(course_id)
                 updated = conn.execute(
                     f"""
                     update courses
-                    set {assignments}
+                    set {", ".join(assignments)}
                     where id = %s
                     """,
                     params,
@@ -276,6 +311,7 @@ def update_course(course_id: str, updates: dict) -> dict:
                 raise HTTPException(status_code=404, detail="Not found")
     except psycopg.Error as exc:
         raise database_error(exc) from exc
+    track_unsplash_download(download_location)
     return _course(
         course,
         teacher_username=course["teacher_username"] or "",

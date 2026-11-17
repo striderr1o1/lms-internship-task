@@ -64,6 +64,7 @@ def create_course(
         str(body.teacher_id),
         body.name,
         [str(student_id) for student_id in body.student_ids],
+        body.cover.model_dump() if body.cover is not None else None,
     )
 
 

@@ -1,8 +1,17 @@
 from typing import Literal
 from uuid import UUID
 
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import BaseModel, field_validator, model_validator
 
+from app.services.cover_url import (
+    clean_color,
+    clean_https_url,
+    clean_optional_text,
+    clean_unsplash_credit_url,
+    clean_unsplash_id,
+    clean_unsplash_image_url,
+    require_text,
+)
 from app.services.youtube import parse_youtube_video_id
 
 
@@ -37,6 +46,71 @@ def _reject_two_videos(mux_asset_id: UUID | None, youtube_url: str | None) -> No
         raise ValueError("A lesson cannot have both a Mux video and a YouTube video")
 
 
+class CourseCover(BaseModel):
+    image_url: str
+    source: Literal["unsplash", "url", "upload", "generated"] | None = None
+    alt: str | None = None
+    color: str | None = None
+    blur_hash: str | None = None
+    unsplash_id: str | None = None
+    credit_name: str | None = None
+    credit_url: str | None = None
+
+
+class CourseCoverIn(BaseModel):
+    source: Literal["unsplash", "url", "generated"]
+    unsplash_id: str | None = None
+    image_url: str | None = None
+    alt: str | None = None
+    color: str | None = None
+    blur_hash: str | None = None
+    credit_name: str | None = None
+    credit_url: str | None = None
+    download_location: str | None = None
+
+    @field_validator("alt", mode="before")
+    @classmethod
+    def validate_alt(cls, value: object) -> str | None:
+        return clean_optional_text(value, max_len=500, label="Cover alt text")
+
+    @field_validator("blur_hash", mode="before")
+    @classmethod
+    def validate_blur_hash(cls, value: object) -> str | None:
+        return clean_optional_text(value, max_len=64, label="Cover blur hash")
+
+    @field_validator("color", mode="before")
+    @classmethod
+    def validate_color(cls, value: object) -> str | None:
+        return clean_color(value)
+
+    @field_validator("download_location", mode="before")
+    @classmethod
+    def validate_download_location(cls, value: object) -> str | None:
+        return clean_optional_text(value, max_len=2048, label="Cover download location")
+
+    @model_validator(mode="after")
+    def validate_source(self) -> "CourseCoverIn":
+        if self.source == "unsplash":
+            self.image_url = clean_unsplash_image_url(self.image_url)
+            self.unsplash_id = clean_unsplash_id(self.unsplash_id)
+            self.credit_name = require_text(
+                self.credit_name,
+                max_len=200,
+                label="Cover credit name",
+            )
+            self.credit_url = clean_unsplash_credit_url(self.credit_url)
+            return self
+        if self.source == "url":
+            self.image_url = clean_https_url(self.image_url, label="Cover image URL")
+        else:
+            self.image_url = None
+        self.unsplash_id = None
+        self.credit_name = None
+        self.credit_url = None
+        self.download_location = None
+        return self
+
+
 class CourseCreate(BaseModel):
     name: str
 
@@ -50,6 +124,7 @@ class AdminCourseCreate(BaseModel):
     teacher_id: UUID
     name: str
     student_ids: list[UUID]
+    cover: CourseCoverIn | None = None
 
     @field_validator("name")
     @classmethod
@@ -60,6 +135,7 @@ class AdminCourseCreate(BaseModel):
 class CourseUpdate(BaseModel):
     name: str | None = None
     status: Literal["active", "inactive"] | None = None
+    cover: CourseCoverIn | None = None
 
     @field_validator("name")
     @classmethod
@@ -71,7 +147,7 @@ class CourseUpdate(BaseModel):
     @model_validator(mode="after")
     def at_least_one(self) -> "CourseUpdate":
         if not self.model_fields_set:
-            raise ValueError("At least one of name or status is required")
+            raise ValueError("At least one of name, status, or cover is required")
         if "name" in self.model_fields_set and self.name is None:
             raise ValueError("Name must be between 1 and 120 characters")
         if "status" in self.model_fields_set and self.status is None:
@@ -86,6 +162,7 @@ class CourseOut(BaseModel):
     created_at: str
     teacher_username: str
     lesson_count: int
+    cover: CourseCover | None
 
 
 class StudentCourseOut(CourseOut):

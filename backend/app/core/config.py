@@ -22,6 +22,7 @@ class Settings(BaseSettings):
     mux_token_id: str = ""
     mux_token_secret: str = ""
     mux_webhook_secret: str = ""
+    unsplash_access_key: str = ""
 
     @field_validator("jwt_secret")
     @classmethod

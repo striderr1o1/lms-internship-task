@@ -2,7 +2,7 @@ import psycopg
 from fastapi import HTTPException
 
 from app.db import database_error, query_all, query_one
-from app.services.course_service import _course
+from app.services.course_service import COVER_SELECT, _course
 
 
 def enroll(student_id: str, course_id: str) -> dict:
@@ -31,12 +31,13 @@ def enroll(student_id: str, course_id: str) -> dict:
 def list_enrollments(student_id: str) -> list[dict]:
     try:
         found = query_all(
-            """
+            f"""
             select
               c.id,
               c.name,
               c.status,
               c.created_at,
+              {COVER_SELECT},
               p.username as teacher_username,
               count(l.id)::int as lesson_count
             from enrollments as e
