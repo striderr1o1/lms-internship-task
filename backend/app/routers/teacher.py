@@ -17,6 +17,30 @@ from app.services import course_service, lesson_service, mux_service
 router = APIRouter(prefix="/teacher", tags=["teacher"])
 
 
+def _block_rows(blocks: list) -> list[dict]:
+    rows: list[dict] = []
+    for block in blocks:
+        if block.kind == "text":
+            rows.append(
+                {
+                    "kind": "text",
+                    "body": block.body,
+                    "mux_asset_id": None,
+                    "youtube_video_id": None,
+                }
+            )
+            continue
+        rows.append(
+            {
+                "kind": "video",
+                "body": "",
+                "mux_asset_id": block.mux_asset_id,
+                "youtube_video_id": block.youtube_video_id,
+            }
+        )
+    return rows
+
+
 @router.get("/courses", response_model=list[CourseOut])
 def list_courses(user: CurrentUser = Depends(require_role("teacher"))) -> list[dict]:
     return course_service.list_teacher_courses(user.role_row_id)
@@ -44,9 +68,7 @@ def create_lesson(
         user.role_row_id,
         str(course_id),
         body.title,
-        body.body,
-        body.mux_asset_id,
-        body.youtube_video_id,
+        _block_rows(body.blocks),
     )
 
 
@@ -56,10 +78,11 @@ def update_lesson(
     body: LessonUpdate,
     user: CurrentUser = Depends(require_role("teacher")),
 ) -> dict:
-    updates = body.model_dump(exclude_unset=True)
-    if "youtube_url" in updates:
-        updates["youtube_video_id"] = body.youtube_video_id
-        del updates["youtube_url"]
+    updates: dict = {}
+    if "title" in body.model_fields_set:
+        updates["title"] = body.title
+    if "blocks" in body.model_fields_set and body.blocks is not None:
+        updates["blocks"] = _block_rows(body.blocks)
     return lesson_service.update_lesson(
         user.role_row_id,
         str(lesson_id),

@@ -1,7 +1,7 @@
-from typing import Literal
+from typing import Annotated, Literal
 from uuid import UUID
 
-from pydantic import BaseModel, field_validator, model_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 from app.services.cover_url import (
     clean_color,
@@ -27,23 +27,6 @@ def _clean_title(value: str) -> str:
     if not 1 <= len(cleaned) <= 160:
         raise ValueError("Title must be between 1 and 160 characters")
     return cleaned
-
-
-def _clean_youtube_url(value: object) -> str | None:
-    if value is None:
-        return None
-    if not isinstance(value, str):
-        raise ValueError("YouTube URL must be a string")
-    cleaned = value.strip()
-    if not cleaned:
-        return None
-    parse_youtube_video_id(cleaned)
-    return cleaned
-
-
-def _reject_two_videos(mux_asset_id: UUID | None, youtube_url: str | None) -> None:
-    if mux_asset_id is not None and youtube_url is not None:
-        raise ValueError("A lesson cannot have both a Mux video and a YouTube video")
 
 
 class CourseCover(BaseModel):
@@ -169,19 +152,51 @@ class StudentCourseOut(CourseOut):
     enrolled: bool
 
 
-class StudentLesson(BaseModel):
+class StudentTextBlock(BaseModel):
     id: UUID
-    lesson_number: int
-    title: str
+    position: int
+    kind: Literal["text"]
     body: str
+
+
+class StudentVideoBlock(BaseModel):
+    id: UUID
+    position: int
+    kind: Literal["video"]
     playback_id: str | None
     youtube_video_id: str | None
 
 
-class TeacherLesson(StudentLesson):
+StudentBlock = Annotated[
+    StudentTextBlock | StudentVideoBlock,
+    Field(discriminator="kind"),
+]
+
+
+class TeacherVideoBlock(StudentVideoBlock):
     mux_asset_id: UUID | None
     video_status: Literal["waiting", "asset_created", "ready", "errored"] | None
-    video_source: Literal["mux", "youtube"] | None
+    video_source: Literal["mux", "youtube"]
+
+
+TeacherBlock = Annotated[
+    StudentTextBlock | TeacherVideoBlock,
+    Field(discriminator="kind"),
+]
+
+
+class StudentLesson(BaseModel):
+    id: UUID
+    lesson_number: int
+    title: str
+    blocks: list[StudentBlock]
+
+
+class TeacherLesson(BaseModel):
+    id: UUID
+    lesson_number: int
+    title: str
+    blocks: list[TeacherBlock]
 
 
 class StudentCourseDetail(CourseOut):
@@ -198,34 +213,52 @@ class TeacherCourseDetail(CourseOut):
     students: list[CourseStudent]
 
 
-class LessonCreate(BaseModel):
-    title: str
-    body: str = ""
+class TextBlockIn(BaseModel):
+    kind: Literal["text"]
+    body: str
     mux_asset_id: UUID | None = None
     youtube_url: str | None = None
-
-    @field_validator("title")
-    @classmethod
-    def validate_title(cls, value: str) -> str:
-        return _clean_title(value)
 
     @field_validator("body", mode="before")
     @classmethod
     def validate_body(cls, value: object) -> str:
-        if value is None:
-            return ""
         if not isinstance(value, str):
             raise ValueError("Body must be a string")
         return value
 
+    @model_validator(mode="after")
+    def no_video(self) -> "TextBlockIn":
+        if self.mux_asset_id is not None or self.youtube_url is not None:
+            raise ValueError("A text block cannot include a video")
+        return self
+
+
+class VideoBlockIn(BaseModel):
+    kind: Literal["video"]
+    mux_asset_id: UUID | None = None
+    youtube_url: str | None = None
+
     @field_validator("youtube_url", mode="before")
     @classmethod
     def validate_youtube_url(cls, value: object) -> str | None:
-        return _clean_youtube_url(value)
+        if value is None:
+            return None
+        if not isinstance(value, str):
+            raise ValueError("YouTube URL must be a string")
+        cleaned = value.strip()
+        if not cleaned:
+            raise ValueError("Invalid YouTube URL")
+        parse_youtube_video_id(cleaned)
+        return cleaned
 
     @model_validator(mode="after")
-    def single_video(self) -> "LessonCreate":
-        _reject_two_videos(self.mux_asset_id, self.youtube_url)
+    def exactly_one_video(self) -> "VideoBlockIn":
+        has_mux = self.mux_asset_id is not None
+        has_youtube = self.youtube_url is not None
+        if has_mux and has_youtube:
+            raise ValueError("A video block cannot have both a Mux video and a YouTube video")
+        if not has_mux and not has_youtube:
+            raise ValueError("A video block needs a Mux video or a YouTube URL")
         return self
 
     @property
@@ -235,11 +268,49 @@ class LessonCreate(BaseModel):
         return parse_youtube_video_id(self.youtube_url)
 
 
+LessonBlockIn = Annotated[
+    TextBlockIn | VideoBlockIn,
+    Field(discriminator="kind"),
+]
+
+
+def _require_block_count(blocks: list[LessonBlockIn]) -> None:
+    if not 1 <= len(blocks) <= 40:
+        raise ValueError("A lesson must have between 1 and 40 blocks")
+
+
+def _require_lesson_content(blocks: list[LessonBlockIn]) -> None:
+    has_video = False
+    has_text = False
+    for block in blocks:
+        if isinstance(block, VideoBlockIn):
+            has_video = True
+            continue
+        if block.body.strip():
+            has_text = True
+    if not has_video and not has_text:
+        raise ValueError("A lesson needs a video or non-blank text")
+
+
+class LessonCreate(BaseModel):
+    title: str
+    blocks: list[LessonBlockIn]
+
+    @field_validator("title")
+    @classmethod
+    def validate_title(cls, value: str) -> str:
+        return _clean_title(value)
+
+    @model_validator(mode="after")
+    def validate_blocks(self) -> "LessonCreate":
+        _require_block_count(self.blocks)
+        _require_lesson_content(self.blocks)
+        return self
+
+
 class LessonUpdate(BaseModel):
     title: str | None = None
-    body: str | None = None
-    mux_asset_id: UUID | None = None
-    youtube_url: str | None = None
+    blocks: list[LessonBlockIn] | None = None
 
     @field_validator("title")
     @classmethod
@@ -248,36 +319,18 @@ class LessonUpdate(BaseModel):
             return None
         return _clean_title(value)
 
-    @field_validator("body")
-    @classmethod
-    def validate_body(cls, value: str | None) -> str | None:
-        if value is None:
-            return None
-        return value
-
-    @field_validator("youtube_url", mode="before")
-    @classmethod
-    def validate_youtube_url(cls, value: object) -> str | None:
-        return _clean_youtube_url(value)
-
     @model_validator(mode="after")
     def at_least_one(self) -> "LessonUpdate":
-        _reject_two_videos(self.mux_asset_id, self.youtube_url)
-        if not self.model_fields_set:
-            raise ValueError(
-                "At least one of title, body, mux_asset_id, or youtube_url is required"
-            )
+        if "title" not in self.model_fields_set and "blocks" not in self.model_fields_set:
+            raise ValueError("At least one of title or blocks is required")
         if "title" in self.model_fields_set and self.title is None:
             raise ValueError("Title must be between 1 and 160 characters")
-        if "body" in self.model_fields_set and self.body is None:
-            raise ValueError("Body must be a string")
+        if "blocks" in self.model_fields_set:
+            if self.blocks is None:
+                raise ValueError("A lesson must have between 1 and 40 blocks")
+            _require_block_count(self.blocks)
+            _require_lesson_content(self.blocks)
         return self
-
-    @property
-    def youtube_video_id(self) -> str | None:
-        if self.youtube_url is None:
-            return None
-        return parse_youtube_video_id(self.youtube_url)
 
 
 class EnrollmentOut(BaseModel):

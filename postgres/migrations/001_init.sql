@@ -85,21 +85,50 @@ create table public.lessons (
   course_id uuid not null references public.courses (id) on delete cascade,
   lesson_number integer not null,
   title text not null,
-  body text not null default '',
-  mux_asset_id uuid references public.mux_assets (id) on delete set null,
-  youtube_video_id text,
   created_at timestamptz not null default now(),
   constraint lessons_number_positive check (lesson_number > 0),
   constraint lessons_title_len check (char_length(title) between 1 and 160),
-  constraint lessons_youtube_video_id_check check (
-    youtube_video_id is null or youtube_video_id ~ '^[A-Za-z0-9_-]{11}$'
-  ),
-  constraint lessons_one_video_check check (mux_asset_id is null or youtube_video_id is null),
   constraint lessons_course_number_key unique (course_id, lesson_number) deferrable initially deferred
 );
 
 create index lessons_course_id_idx on public.lessons (course_id);
-create index lessons_mux_asset_id_idx on public.lessons (mux_asset_id);
+
+create table public.lesson_blocks (
+  id uuid primary key default gen_random_uuid(),
+  lesson_id uuid not null,
+  position integer not null,
+  kind text not null,
+  body text not null default '',
+  mux_asset_id uuid,
+  youtube_video_id text,
+  constraint lesson_blocks_lesson_id_fkey
+    foreign key (lesson_id) references public.lessons (id) on delete cascade,
+  constraint lesson_blocks_mux_asset_id_fkey
+    foreign key (mux_asset_id) references public.mux_assets (id) on delete set null,
+  constraint lesson_blocks_position_positive check (position > 0),
+  constraint lesson_blocks_kind_check check (kind in ('text', 'video')),
+  constraint lesson_blocks_youtube_video_id_check check (
+    youtube_video_id is null or youtube_video_id ~ '^[A-Za-z0-9_-]{11}$'
+  ),
+  constraint lesson_blocks_shape_check check (
+    (
+      kind = 'text'
+      and mux_asset_id is null
+      and youtube_video_id is null
+    )
+    or (
+      kind = 'video'
+      and (
+        (mux_asset_id is not null and youtube_video_id is null)
+        or (mux_asset_id is null and youtube_video_id is not null)
+      )
+    )
+  ),
+  constraint lesson_blocks_lesson_position_key unique (lesson_id, position)
+);
+
+create index lesson_blocks_lesson_id_idx on public.lesson_blocks (lesson_id);
+create index lesson_blocks_mux_asset_id_idx on public.lesson_blocks (mux_asset_id);
 
 create table public.enrollments (
   id uuid primary key default gen_random_uuid(),
@@ -128,10 +157,7 @@ create index refresh_tokens_profile_id_idx on public.refresh_tokens (profile_id)
 create function public.create_lesson(
   p_course_id uuid,
   p_teacher_id uuid,
-  p_title text,
-  p_body text,
-  p_mux_asset_id uuid,
-  p_youtube_video_id text
+  p_title text
 )
 returns uuid
 language plpgsql
@@ -140,7 +166,6 @@ set search_path = ''
 as $$
 declare
   v_owner uuid;
-  v_asset_owner uuid;
   v_number integer;
   v_id uuid;
 begin
@@ -155,18 +180,6 @@ begin
       using errcode = 'P0002';
   end if;
 
-  if p_mux_asset_id is not null then
-    select m.teacher_id
-      into v_asset_owner
-    from public.mux_assets as m
-    where m.id = p_mux_asset_id;
-
-    if v_asset_owner is null or v_asset_owner is distinct from p_teacher_id then
-      raise exception 'not found'
-        using errcode = 'P0002';
-    end if;
-  end if;
-
   select coalesce(max(l.lesson_number), 0) + 1
     into v_number
   from public.lessons as l
@@ -175,18 +188,12 @@ begin
   insert into public.lessons (
     course_id,
     lesson_number,
-    title,
-    body,
-    mux_asset_id,
-    youtube_video_id
+    title
   )
   values (
     p_course_id,
     v_number,
-    p_title,
-    coalesce(p_body, ''),
-    p_mux_asset_id,
-    p_youtube_video_id
+    p_title
   )
   returning id into v_id;
 
@@ -235,5 +242,5 @@ begin
 end;
 $$;
 
-revoke all on function public.create_lesson(uuid, uuid, text, text, uuid, text) from public;
+revoke all on function public.create_lesson(uuid, uuid, text) from public;
 revoke all on function public.delete_lesson(uuid, uuid) from public;

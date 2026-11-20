@@ -44,18 +44,22 @@ join teachers as t on t.id = c.teacher_id
 join profiles as p on p.id = t.profile_id
 """
 
-_LESSONS = """
+_LESSON_BLOCKS = """
 select
   l.id,
   l.lesson_number,
   l.title,
-  l.body,
-  l.mux_asset_id,
-  l.youtube_video_id,
+  b.id as block_id,
+  b.position as block_position,
+  b.kind as block_kind,
+  b.body as block_body,
+  b.mux_asset_id as block_mux_asset_id,
+  b.youtube_video_id as block_youtube_video_id,
   m.status as mux_status,
   m.playback_id as mux_playback_id
 from lessons as l
-left join mux_assets as m on m.id = l.mux_asset_id
+left join lesson_blocks as b on b.lesson_id = l.id
+left join mux_assets as m on m.id = b.mux_asset_id
 """
 
 
@@ -167,16 +171,16 @@ def get_student_course(student_id: str, course_id: str) -> dict:
             if found is None:
                 raise HTTPException(status_code=404, detail="Not found")
             lesson_rows = conn.execute(
-                _LESSONS
+                _LESSON_BLOCKS
                 + """
                 where l.course_id = %s
-                order by l.lesson_number
+                order by l.lesson_number, b.position
                 """,
                 (course_id,),
             ).fetchall()
     except psycopg.Error as exc:
         raise database_error(exc) from exc
-    lessons = [_student_lesson(row) for row in lesson_rows]
+    lessons = _lessons_from_rows(lesson_rows, teacher=False)
     course = _course(
         found,
         teacher_username=found["teacher_username"] or "",
@@ -199,10 +203,10 @@ def get_teacher_course(teacher_id: str, course_id: str) -> dict:
             if found is None:
                 raise HTTPException(status_code=404, detail="Not found")
             lesson_rows = conn.execute(
-                _LESSONS
+                _LESSON_BLOCKS
                 + """
                 where l.course_id = %s
-                order by l.lesson_number
+                order by l.lesson_number, b.position
                 """,
                 (course_id,),
             ).fetchall()
@@ -221,7 +225,7 @@ def get_teacher_course(teacher_id: str, course_id: str) -> dict:
             ).fetchall()
     except psycopg.Error as exc:
         raise database_error(exc) from exc
-    lessons = [_teacher_lesson(row) for row in lesson_rows]
+    lessons = _lessons_from_rows(lesson_rows, teacher=True)
     course = _course(
         found,
         teacher_username=found["teacher_username"] or "",
@@ -237,15 +241,16 @@ def get_teacher_course(teacher_id: str, course_id: str) -> dict:
 
 def _load_teacher_lesson(lesson_id: str) -> dict:
     try:
-        row = query_one(
-            _LESSONS + " where l.id = %s",
+        rows = query_all(
+            _LESSON_BLOCKS + " where l.id = %s order by b.position",
             (lesson_id,),
         )
     except psycopg.Error as exc:
         raise database_error(exc) from exc
-    if row is None:
+    lessons = _lessons_from_rows(rows, teacher=True)
+    if not lessons:
         raise HTTPException(status_code=404, detail="Not found")
-    return _teacher_lesson(row)
+    return lessons[0]
 
 
 def _listed_course(row: dict, *, enrolled: bool | None = None) -> dict:
@@ -257,34 +262,53 @@ def _listed_course(row: dict, *, enrolled: bool | None = None) -> dict:
     )
 
 
-def _student_lesson(row: dict) -> dict:
+def _lessons_from_rows(rows: list[dict], *, teacher: bool) -> list[dict]:
+    lessons: list[dict] = []
+    index: dict[object, dict] = {}
+    for row in rows:
+        lesson = index.get(row["id"])
+        if lesson is None:
+            lesson = {
+                "id": row["id"],
+                "lesson_number": row["lesson_number"],
+                "title": row["title"],
+                "blocks": [],
+            }
+            index[row["id"]] = lesson
+            lessons.append(lesson)
+        block = _block(row, teacher=teacher)
+        if block is not None:
+            lesson["blocks"].append(block)
+    return lessons
+
+
+def _block(row: dict, *, teacher: bool) -> dict | None:
+    if row["block_id"] is None:
+        return None
+    if row["block_kind"] == "text":
+        body = row["block_body"]
+        return {
+            "id": row["block_id"],
+            "position": row["block_position"],
+            "kind": "text",
+            "body": body if isinstance(body, str) else "",
+        }
     playback_id = None
     if row.get("mux_status") == "ready":
         playback_id = row.get("mux_playback_id")
-    return {
-        "id": row["id"],
-        "lesson_number": row["lesson_number"],
-        "title": row["title"],
-        "body": row["body"],
+    block = {
+        "id": row["block_id"],
+        "position": row["block_position"],
+        "kind": "video",
         "playback_id": playback_id,
-        "youtube_video_id": row.get("youtube_video_id") or None,
+        "youtube_video_id": row.get("block_youtube_video_id"),
     }
-
-
-def _teacher_lesson(row: dict) -> dict:
-    lesson = _student_lesson(row)
-    lesson["mux_asset_id"] = row.get("mux_asset_id")
-    lesson["video_status"] = row.get("mux_status")
-    lesson["video_source"] = _video_source(lesson["mux_asset_id"], lesson["youtube_video_id"])
-    return lesson
-
-
-def _video_source(mux_asset_id: object, youtube_video_id: str | None) -> str | None:
-    if mux_asset_id:
-        return "mux"
-    if youtube_video_id:
-        return "youtube"
-    return None
+    if teacher:
+        mux_asset_id = row.get("block_mux_asset_id")
+        block["mux_asset_id"] = mux_asset_id
+        block["video_status"] = row.get("mux_status")
+        block["video_source"] = "mux" if mux_asset_id is not None else "youtube"
+    return block
 
 
 def course_cover(row: dict) -> dict | None:
