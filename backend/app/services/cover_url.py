@@ -142,6 +142,31 @@ def is_blocked_ip(ip: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
     )
 
 
+def assert_stored_cover_host(url: str) -> None:
+    """Reject local hosts without looking the name up or fetching the URL."""
+    parsed = urlparse(url)
+    host = parsed.hostname
+    if parsed.scheme != "https" or not host:
+        raise ValueError("Cover image URL must use https")
+    if parsed.username is not None or parsed.password is not None:
+        raise ValueError("Cover image URL must not include credentials")
+    try:
+        literal = ipaddress.ip_address(host)
+    except ValueError:
+        literal = None
+    if literal is not None:
+        if is_blocked_ip(literal):
+            raise ValueError("Cover image URL host is not allowed")
+        return
+    lowered = host.lower().rstrip(".")
+    if (
+        lowered == "localhost"
+        or lowered.endswith(".localhost")
+        or lowered.endswith(".localdomain")
+    ):
+        raise ValueError("Cover image URL host is not allowed")
+
+
 def assert_public_host(url: str) -> None:
     parsed = urlparse(url)
     try:

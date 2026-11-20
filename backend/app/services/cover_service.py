@@ -13,6 +13,7 @@ from app.core.config import get_settings
 from app.services.course_service import COVER_COLUMNS
 from app.services.cover_url import (
     assert_public_host,
+    assert_stored_cover_host,
     clean_color,
     clean_https_url,
     clean_optional_text,
@@ -65,7 +66,7 @@ def prepare_cover(cover: dict | None) -> tuple[dict[str, str | None], str | None
             ), None
         if source == "url":
             image_url = clean_https_url(cover.get("image_url"), label="Cover image URL")
-            assert_public_image(image_url)
+            assert_stored_cover_host(image_url)
             return _columns(
                 image_url=image_url,
                 source="url",
