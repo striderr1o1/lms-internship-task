@@ -4,9 +4,9 @@ FastAPI backend for a three-role learning system: student, teacher, and admin. T
 
 ## What it does
 
-- **Students** browse active courses, enroll, and open a course they have joined. A lesson includes its notes and a Mux playback id once the video is ready.
-- **Teachers** create and rename courses, mark a course active or inactive, and add lessons with Markdown notes and an optional video. Lesson numbers stay contiguous inside a course.
-- **Admins** see counts of students, teachers, and courses, plus each teacher's courses and the students enrolled in them. They also approve later admin signups.
+- **Students** see only the active courses an admin assigned to them. A lesson is an ordered list of text and video blocks. A video plays from Mux once that asset is `ready`, or from YouTube.
+- **Teachers** open the courses an admin assigned to them. They add lessons, and each lesson is 1 to 40 blocks of Markdown notes and videos. A video block is either a Mux upload or a YouTube URL. Lesson numbers stay contiguous inside a course. Teachers do not create or delete courses.
+- **Admins** create courses, name them, assign a teacher and the students who can see them, and set a cover. They see counts of students, teachers, and courses, and they approve later admin signups.
 
 Each account has one role. Sign-in must use the same role the account was created with.
 
@@ -17,7 +17,7 @@ Each account has one role. Sign-in must use the same role the account was create
 - Local Postgres 17, accessed with a psycopg pool
 - Mux direct uploads and webhooks
 
-Schema for this database is [`postgres/migrations/001_init.sql`](postgres/migrations/001_init.sql). On a new data volume, Compose applies that file when Postgres starts. [`supabase/migrations`](supabase/migrations) is the old Supabase history and is not what you apply for this local database.
+[`postgres/migrations/001_init.sql`](postgres/migrations/001_init.sql) is the schema for a new database, including course covers and `lesson_blocks`. Compose applies that file when Postgres starts on an empty data volume. [`002_course_covers.sql`](postgres/migrations/002_course_covers.sql) and [`003_lesson_blocks.sql`](postgres/migrations/003_lesson_blocks.sql) upgrade a database created from an older `001`. Both are safe to run again. [`supabase/migrations`](supabase/migrations) is the old Supabase history and is not what you apply for this local database.
 
 ## Setup
 
@@ -42,6 +42,7 @@ cp backend/.env.example backend/.env
 | `MUX_TOKEN_ID` | Mux API access token id |
 | `MUX_TOKEN_SECRET` | Mux API access token secret |
 | `MUX_WEBHOOK_SECRET` | Verifies `POST /api/webhooks/mux`. Optional until that route is used |
+| `UNSPLASH_ACCESS_KEY` | Unsplash access key for cover search. If it is empty, search returns 503 and the cover picker hides the Unsplash tab |
 
 Do not commit `.env`.
 
@@ -85,32 +86,48 @@ All paths are under `/api`.
 
 **Student**
 
-- `GET /student/courses` lists active courses
-- `GET /student/courses/{course_id}` returns the course and its lessons after enrollment
-- `POST /student/courses/{course_id}/enroll`
-- `GET /student/enrollments`
+- `GET /student/courses` lists active courses assigned to the student
+- `GET /student/courses/{course_id}` returns one assigned active course and its lessons
+- `GET /student/enrollments` lists the same assigned active courses
+
+Each lesson is `{ id, lesson_number, title, blocks }`. A text block is `{ id, position, kind: "text", body }`. A video block is `{ id, position, kind: "video", playback_id, youtube_video_id }`. `playback_id` is set only when the Mux asset is `ready`. Students do not receive `mux_asset_id`.
 
 **Teacher**
 
 - `GET /teacher/courses`
-- `POST /teacher/courses` with `{ name }`
 - `GET /teacher/courses/{course_id}`
-- `PATCH /teacher/courses/{course_id}` with `{ name?, status? }`
-- `DELETE /teacher/courses/{course_id}`
-- `POST /teacher/courses/{course_id}/lessons` with `{ title, body, mux_asset_id? }`. A lesson video is either a Mux upload or a YouTube id.
-- `PATCH /teacher/lessons/{lesson_id}`
+- `POST /teacher/courses/{course_id}/lessons` with `{ title, blocks }`
+- `PATCH /teacher/lessons/{lesson_id}` with at least one of `title` or `blocks`
 - `DELETE /teacher/lessons/{lesson_id}` renumbers the remaining lessons
 - `POST /teacher/videos/uploads` returns an upload URL for a video file
 - `GET /teacher/videos/{video_id}` returns `waiting`, `asset_created`, `ready`, or `errored`
 
+`blocks` has 1 to 40 items. A text block is `{ kind: "text", body }`. A video block sends exactly one of `{ kind: "video", mux_asset_id }` or `{ kind: "video", youtube_url }`. The lesson is rejected when every text block is blank and there is no video. Sending `blocks` replaces the whole list. A teacher video block in the response also includes `mux_asset_id`, `video_status`, and `video_source` (`mux` or `youtube`).
+
 **Admin**
 
 - `GET /admin/overview`
-- `GET /admin/admins`
+- `GET /admin/teachers`
+- `GET /admin/students`
+- `GET /admin/admins` lists pending admins by default. `?status=approved` lists approved admins
 - `POST /admin/admins/{admin_id}/approve`
+- `POST /admin/courses` with `{ teacher_id, name, student_ids, cover? }`
+- `PATCH /admin/courses/{course_id}` with at least one of `name`, `status` (`active` or `inactive`), or `cover`
+- `DELETE /admin/courses/{course_id}`
+- `POST /admin/courses/{course_id}/students` with `{ student_id }`
+- `DELETE /admin/courses/{course_id}/students/{student_id}`
+
+`cover.source` is `unsplash`, `url`, or `generated`. A pasted cover stores the https URL. The API does not fetch it. Local hosts such as `localhost` and `127.0.0.1` are rejected.
+
+**Public**
+
+- `GET /public/stats` returns `{ courses, lessons, learners }`
+- `GET /public/courses/featured` returns up to 6 active courses with a cover, lesson count, and teacher display name
+
+**Images**
+
+- `GET /images/unsplash/search?query=&page=` searches Unsplash for an admin. It returns 503 when `UNSPLASH_ACCESS_KEY` is missing or Unsplash is unavailable
 
 **Mux**
 
 - `POST /webhooks/mux` accepts a Mux webhook signed with `MUX_WEBHOOK_SECRET`
-
-A student sees `playback_id` only after the linked Mux asset is `ready`.
